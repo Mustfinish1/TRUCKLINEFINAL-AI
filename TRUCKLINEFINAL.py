@@ -58,7 +58,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ {lic['tier']} till {lic['expiry'].date()}\n"
             "/setkeys API_KEY SECRET PASSPHRASE")
-      else:
+    else:
         await update.message.reply_text(
             f"🤖 {lic['tier']} till {lic['expiry'].date()}\n"
             "/trade /positions /balance /status /signals /referral")
@@ -76,7 +76,7 @@ async def subscribe_cmd(update, context):
         f"💳 {tier}\nBase ${inv['base']:.2f}\nEXACT ${inv['exact']:.2f} USDT TRC20\n"
         f"Invoice {inv['invoice_id']}\nExpires {inv['expires'].strftime('%H:%M UTC')}\n\n"
         f"Send EXACT ${inv['exact']:.2f} to:\n{USDT_WALLET}\n\n"
-  f"Then /verify {inv['invoice_id']} TXHASH")
+        f"Then /verify {inv['invoice_id']} TXHASH")
 
 async def verify_cmd(update, context):
     uid = update.effective_user.id
@@ -88,7 +88,7 @@ async def verify_cmd(update, context):
     inv = get_invoice(invoice_id, uid)
     if not inv:
         await update.message.reply_text("Invoice not found"); return
-      if inv["status"] != "PENDING":
+    if inv["status"] != "PENDING":
         await update.message.reply_text("Not pending"); return
     if now_utc() > parse_dt(inv["expires_at"]):
         await update.message.reply_text("Expired /subscribe again"); return
@@ -106,7 +106,7 @@ async def verify_cmd(update, context):
 async def setkeys_cmd(update, context):
     uid = update.effective_user.id
     if not license_info(uid)["valid"]:
-      await update.message.reply_text("❌ Subscribe first"); return
+        await update.message.reply_text("❌ Subscribe first"); return
     if len(context.args) != 3:
         await update.message.reply_text("Usage: /setkeys API_KEY SECRET PASSPHRASE"); return
     ak, sec, pp = context.args
@@ -124,7 +124,7 @@ async def setkeys_cmd(update, context):
         await update.effective_chat.send_message(
             f"✅ Keys OK · USDT free ${free:.2f}\n🔐 Encrypted\n"
             f"⚠️ READ+TRADE only · NO WITHDRAW permission")
-      except Exception as e:
+    except Exception as e:
         await update.message.reply_text(f"❌ Keys fail: {e}")
     finally:
         if ex:
@@ -136,7 +136,7 @@ async def positions_cmd(update, context):
     if not rows:
         await update.message.reply_text("No positions"); return
     lines = []
-  for p in rows:
+    for p in rows:
         lines.append(
             f"{p['symbol']} entry {to_dec(p['entry_price']):.6f} "
             f"SL {to_dec(p['sl']):.6f} "
@@ -153,7 +153,7 @@ async def balance_cmd(update, context):
     ex = make_exchange(keys)
     try:
         bal = await ex.fetch_balance()
-      free = to_dec(bal.get("USDT", {}).get("free") or 0)
+        free = to_dec(bal.get("USDT", {}).get("free") or 0)
         total = to_dec(bal.get("USDT", {}).get("total") or 0)
         peak = get_peak_equity(uid) or total
         dd = ((peak - total) / peak * 100) if peak > 0 else Decimal("0")
@@ -170,7 +170,7 @@ async def status_cmd(update, context):
     with db() as c:
         row = c.execute("SELECT pnl FROM daily_pnl WHERE user_id=? AND day=?",
                         (uid, now_utc().date().isoformat())).fetchone()
-      pnl = to_dec(row["pnl"]) if row else Decimal("0")
+    pnl = to_dec(row["pnl"]) if row else Decimal("0")
     pos = len(open_positions(uid))
     keys = get_keys(uid)
     trading = trading_enabled(uid)
@@ -188,7 +188,7 @@ async def trade_cmd(update, context):
         await update.message.reply_text("❌ /setkeys"); return
     if not LIVE_MODE:
         await update.message.reply_text("🧪 LIVE_MODE=false — enable in .env"); return
-      await update.message.reply_text("🚀 Scanning…")
+    await update.message.reply_text("🚀 Scanning…")
     await trade_for_user(uid, context.bot, broadcast=True)
 
 async def signals_cmd(update, context):
@@ -206,7 +206,7 @@ async def signals_cmd(update, context):
         any_sig = False
         for sym in SYMBOLS[lic["tier"]]:
             sig = await compute_signal(ex, sym)
-             if sig.ok:
+            if sig.ok:
                 any_sig = True
                 await update.message.reply_text(
                     f"🚨 {sym} LONG conf {sig.confidence}/10\n"
@@ -223,7 +223,7 @@ async def stop_cmd(update, context):
     if not keys:
         await update.message.reply_text("❌ /setkeys"); return
     rows = open_positions(uid)
-if not rows:
+    if not rows:
         await update.message.reply_text("No positions"); return
     await update.message.reply_text("🛑 Closing all positions…")
     ex = make_exchange(keys)
@@ -241,7 +241,7 @@ if not rows:
 async def pause_cmd(update, context):
     if not is_admin(update.effective_user.id): return
     set_state("EMERGENCY_STOP", "true")
-  await update.message.reply_text("⏸ Global trading paused")
+    await update.message.reply_text("⏸ Global trading paused")
 
 async def resume_cmd(update, context):
     if not is_admin(update.effective_user.id): return
@@ -259,7 +259,7 @@ async def resume_uid_cmd(update, context):
 async def referral_cmd(update, context):
     uid = update.effective_user.id
     create_user(uid, update.effective_user.username)
-  with db() as c:
+    with db() as c:
         u = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
         n = c.execute("SELECT COUNT(*) n FROM referrals WHERE inviter_id=?", (uid,)).fetchone()["n"]
         pending = c.execute("SELECT COUNT(*) n FROM referral_rewards WHERE inviter_id=? AND status='PENDING'",
@@ -285,7 +285,7 @@ async def pending_refs_cmd(update, context):
     with db() as c:
         rows = c.execute("SELECT id, inviter_id, referred_id, tier, bonus_days, bonus_usdt, "
                          "created_at FROM referral_rewards WHERE status='PENDING' "
-                           "ORDER BY created_at DESC LIMIT 20").fetchall()
+                         "ORDER BY created_at DESC LIMIT 20").fetchall()
     if not rows:
         await update.message.reply_text("No pending ✅"); return
     msg = "⏳ PENDING\n\n"
@@ -303,7 +303,7 @@ async def approve_ref_cmd(update, context):
         c.execute("BEGIN IMMEDIATE")
         r = c.execute("SELECT * FROM referral_rewards WHERE id=? AND status='PENDING'",
                       (rid,)).fetchone()
-      if not r:
+        if not r:
             c.execute("ROLLBACK")
             await update.message.reply_text("Not found"); return
         inviter_id = r["inviter_id"]
