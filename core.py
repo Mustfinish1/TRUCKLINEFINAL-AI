@@ -504,4 +504,240 @@ async def scan_entries(uid, tier, ex, bot, broadcast=False):
         return
 
     if daily_pnl(uid) <= -MAX_DAILY_LOSS_USDT:
-        await send(bot, u
+        await send(bot, uid, f"🛡️ Daily loss breaker -{MAX_DAILY_LOSS_USDT} USDT")
+        set_state(f"TRADING_ENABLED_{uid}", "false")
+        return
+
+    # Drawdown circuit breaker
+    try:
+        bal = await ex.fetch_balance()
+        equity = to_dec(bal.get("USDT", {}).get("total") or 0)
+        if equity > 0:
+            peak = update_equity(uid, equity)
+            if peak > 0 and equity < peak * (Decimal("1") - MAX_DRAWDOWN_PCT / 100):
+                await send(
+                    bot, uid,
+                    f"🛑 {MAX_DRAWDOWN_PCT}% drawdown from peak — trading halted")
+                set_state(f"TRADING_ENABLED_{uid}", "false")
+                return
+    except Exception:
+        bal = {}
+        equity = Decimal("0")
+
+    opens = len(open_positions(uid))
+    if opens >= MAX_OPEN_POSITIONS:
+        return
+
+    free = to_dec(bal.get("USDT", {}).get("free") or 0)
+    if free < Decimal("5"):
+        return
+
+    for sym in SYMBOLS[tier]:
+        if len(open_positions(uid)) >= MAX_OPEN_POSITIONS:
+            break
+        if position_for(uid, sym):
+            continue
+
+        # Correlation bucket guard
+        b = BUCKETS.get(sym, sym)
+        if bucket_counts(uid).get(b, 0) >= MAX_POSITIONS_PER_BUCKET:
+            continue
+
+        try:
+            if not await get_fundamentals(CMAP[sym]):
+                continue
+
+            sig = await compute_signal(ex, sym)
+            if not sig.ok:
+                continue
+
+            if broadcast:
+                await broadcast_signal(bot, sym, sig)
+
+            size_usdt = size_position(free, sig.atr_pct, sig.price)
+            if size_usdt < Decimal("5"):
+                continue
+
+            # Liquidity / spread guard
+            try:
+                ob = await ex.fetch_order_book(sym, 5)
+                if ob and ob["bids"] and ob["asks"]:
+                    bid = to_dec(ob["bids"][0][0])
+                    ask = to_dec(ob["asks"][0][0])
+                    spread = (ask - bid) / bid * 100 if bid > 0 else Decimal("999")
+                    if spread > Decimal("0.15"):
+                        continue
+                    top5_depth = sum(to_dec(x[1]) for x in ob["bids"]) * sig.price
+                    if size_usdt > top5_depth * Decimal("0.1"):
+                        continue
+            except Exception:
+                pass
+
+            raw_amt = size_usdt / sig.price
+            amt = round_amount_down(ex, sym, raw_amt)
+            if amt <= 0:
+                continue
+            m = ex.market(sym)
+            min_cost = to_dec((m.get("limits") or {}).get("cost", {}).get("min") or 0)
+            if amt * sig.price < min_cost:
+                continue
+
+            clordid = gen_clordid(uid, f"open{sym.replace('/', '')}")
+            order = await ex.create_order(
+                sym, "market", "buy", float(amt), None, {"clOrdId": clordid})
+            db_insert_position(uid, sym, order, sig)
+
+            # Exchange-side stops
+            pos = position_for(uid, sym)
+            if pos:
+                sl_id = await place_stop_loss(ex, sym, to_dec(pos["amount"]), to_dec(pos["sl"]))
+                tp_id = await place_take_profit(ex, sym, to_dec(pos["amount"]), to_dec(pos["tp"]))
+                attach_protective_orders(pos["id"], sl_id, tp_id)
+
+            await send(
+                bot, uid,
+                f"🤖 BUY {sym}\n"
+                f"Conf {sig.confidence}/10 | Regime {sig.regime}\n"
+                f"Entry {sig.price} SL {sig.sl} TP {sig.tp}\n"
+                f"Size ${size_usdt:.2f} | ATR {sig.atr_pct:.2f}%")
+            free -= size_usdt
+        except Exception:
+            log.exception(f"entry err {sym}")
+
+# ─────────────────────────────────────────────────────────────
+# RECONCILIATION
+# ─────────────────────────────────────────────────────────────
+async def reconcile_user(uid, ex, bot):
+    """Ensure DB matches exchange. Close orphans, reattach stops."""
+    try:
+        db_open = {p["symbol"]: p for p in open_positions(uid)}
+        balances = await ex.fetch_balance()
+        for sym, p in db_open.items():
+            base = sym.split("/")[0]
+            held = to_dec(balances.get(base, {}).get("total") or 0)
+            if held <= 0:
+                with db() as c:
+                    c.execute(
+                        "UPDATE positions SET status='CLOSED', closed_at=? "
+                        "WHERE id=? AND status='OPEN'",
+                        (iso(now_utc()), p["id"]))
+                await send(bot, uid, f"🔍 Reconciled: {sym} not on exchange — marked closed")
+            else:
+                if not p.get("sl_order_id") or not p.get("tp_order_id"):
+                    sl_id = await place_stop_loss(ex, sym, held, to_dec(p["sl"]))
+                    tp_id = await place_take_profit(ex, sym, held, to_dec(p["tp"]))
+                    attach_protective_orders(p["id"], sl_id, tp_id)
+    except Exception:
+        log.exception("reconcile_user failed")
+
+# ─────────────────────────────────────────────────────────────
+# USER LOCKS + ORCHESTRATION
+# ─────────────────────────────────────────────────────────────
+USER_LOCKS = {}
+
+def user_lock(uid):
+    if uid not in USER_LOCKS:
+        USER_LOCKS[uid] = asyncio.Lock()
+    return USER_LOCKS[uid]
+
+async def trade_for_user(uid, bot, broadcast=False):
+    lic = license_info(uid)
+    if not lic["valid"]:
+        return
+    keys = get_keys(uid)
+    if not keys:
+        return
+    ex = make_exchange(keys)
+    try:
+        async with user_lock(uid):
+            await ex.load_markets()
+            await monitor_positions(uid, ex, bot)
+            await scan_entries(uid, lic["tier"], ex, bot, broadcast=broadcast)
+    finally:
+        await ex.close()
+
+# ─────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────
+async def auto_job(context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        ids = [r["user_id"] for r in c.execute(
+            "SELECT user_id FROM subscriptions WHERE expiry > ?",
+            (iso(now_utc()),)).fetchall()]
+    ids = set(ids) | ADMIN_IDS
+    for uid in ids:
+        try:
+            if get_keys(uid) and license_info(uid)["valid"]:
+                await trade_for_user(uid, context.bot)
+        except Exception:
+            log.exception(f"auto_job {uid}")
+
+async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every 30s. Monitors open positions only, no entries."""
+    with db() as c:
+        ids = [r["user_id"] for r in c.execute(
+            "SELECT DISTINCT user_id FROM positions WHERE status='OPEN'").fetchall()]
+    for uid in ids:
+        keys = get_keys(uid)
+        if not keys:
+            continue
+        ex = make_exchange(keys)
+        try:
+            async with user_lock(uid):
+                await monitor_positions(uid, ex, context.bot)
+        except Exception:
+            log.exception(f"monitor_job {uid}")
+        finally:
+            await ex.close()
+
+async def reconcile_job(context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        ids = [r["user_id"] for r in c.execute(
+            "SELECT DISTINCT user_id FROM positions WHERE status='OPEN'").fetchall()]
+    for uid in ids:
+        keys = get_keys(uid)
+        if not keys:
+            continue
+        ex = make_exchange(keys)
+        try:
+            await ex.load_markets()
+            await reconcile_user(uid, ex, context.bot)
+        except Exception:
+            log.exception(f"reconcile_job {uid}")
+        finally:
+            await ex.close()
+
+async def backup_db_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not DB_PATH.exists():
+            return
+        if not ADMIN_IDS:
+            return
+        backup_path = Path(f"backup_{int(time.time())}.db")
+        try:
+            with db() as c:
+                src = c.execute("SELECT 1").connection
+                dest = sqlite3.connect(backup_path)
+                src.backup(dest)
+                dest.close()
+        except Exception:
+            try:
+                shutil.copy2(DB_PATH, backup_path)
+            except Exception:
+                return
+        for admin_id in ADMIN_IDS:
+            try:
+                with open(backup_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=admin_id, document=f,
+                        filename=f"trucklink_backup_{now_utc().date()}.db",
+                        caption=f"📦 Daily backup {now_utc().date()}")
+                await asyncio.sleep(1)
+            except Exception as e:
+                log.warning(f"Backup send fail {admin_id} {e}")
+        try:
+            backup_path.unlink()
+        except Exception:
+            pass
+    except Exception:
+        log.exception("backup_job fail")
