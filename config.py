@@ -481,3 +481,31 @@ async def get_sentiment():
         return v, 20 < v < 90
     except Exception:
         return 50, False
+# ─────────────────────────────────────────────────────────────
+# DAILY PNL TRACKING (WAS MISSING)
+# ─────────────────────────────────────────────────────────────
+def daily_pnl(uid):
+    day = now_utc().date().isoformat()
+    with db() as c:
+        r = c.execute("SELECT pnl FROM daily_pnl WHERE user_id=? AND day=?", (uid, day)).fetchone()
+    if not r:
+        return Decimal("0")
+    try:
+        return to_dec(r["pnl"])
+    except:
+        return Decimal("0")
+
+def add_daily_pnl(uid, pnl: Decimal):
+    day = now_utc().date().isoformat()
+    with db() as c:
+        cur = c.execute("SELECT pnl FROM daily_pnl WHERE user_id=? AND day=?", (uid, day)).fetchone()
+        if cur:
+            new_val = to_dec(cur["pnl"]) + to_dec(pnl)
+        else:
+            new_val = to_dec(pnl)
+        c.execute("INSERT INTO daily_pnl(user_id,day,pnl) VALUES(?,?,?) "
+                  "ON CONFLICT(user_id,day) DO UPDATE SET pnl=excluded.pnl",
+                  (uid, day, str(new_val)))
+
+# Initialize DB on import
+init_db()
