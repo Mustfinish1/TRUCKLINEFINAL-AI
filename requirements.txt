@@ -1,9 +1,6 @@
-python-telegram-bot[job-queue]
-ccxt
-python-dotenv
-cryptography
-requests
-aiohttp
-pandas
-ta
-numpy
+python-telegram-bot[job-queue]==20.7
+ccxt==4.2.25
+aiohttp==3.9.5
+pandas==2.2.2
+numpy==1.26.4
+cryptography==42.0.8
