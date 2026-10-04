@@ -1,511 +1,231 @@
-# ============================================================
-# TruckLink v5.0 — config.py
-# Env, DB, crypto, users, licensing, invoices, payments, exchange factory
-# ============================================================
-
-import os
-import re
-import sqlite3
-import secrets
-import logging
-import time
-from decimal import Decimal, InvalidOperation
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from contextlib import contextmanager
-
-import aiohttp
-import ccxt.async_support as ccxt_async
+import os, sqlite3, logging, re, uuid, random
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("trucklink")
 
-# ─────────────────────────────────────────────────────────────
-# ENV / CONSTANTS
-# ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "").strip()
-USDT_WALLET         = os.getenv("USDT_WALLET", "").strip()
-OWNER_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-ADMIN_IDS           = {int(x.strip()) for x in os.getenv("ADMIN_IDS", OWNER_CHAT_ID).split(",") if x.strip().isdigit()}
-DB_PATH             = Path(os.getenv("DB_PATH", "trucklink.db"))
-FERNET_KEY          = os.getenv("FERNET_KEY", "").strip()
-
-LIVE_MODE                 = os.getenv("LIVE_MODE", "false").lower() == "true"
-AUTO_TRADE                = os.getenv("AUTO_TRADE", "false").lower() == "true"
-AUTO_INTERVAL_MINUTES     = int(os.getenv("AUTO_INTERVAL_MINUTES", "5"))
-
-MAX_USDT_PER_TRADE        = Decimal(os.getenv("MAX_USDT_PER_TRADE", "20"))
-MAX_PCT_PER_TRADE         = Decimal(os.getenv("MAX_PCT_PER_TRADE", "15"))
-RISK_PER_TRADE_PCT        = Decimal(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
-MAX_DAILY_LOSS_USDT       = Decimal(os.getenv("MAX_DAILY_LOSS_USDT", "30"))
-MAX_DRAWDOWN_PCT          = Decimal(os.getenv("MAX_DRAWDOWN_PCT", "10"))
-MAX_LOSS_PCT              = Decimal(os.getenv("MAX_LOSS_PCT", "1.5"))
-EMERGENCY_LOSS_PCT        = Decimal(os.getenv("EMERGENCY_LOSS_PCT", "2.5"))
-TAKE_PROFIT_PCT           = Decimal(os.getenv("TAKE_PROFIT_PCT", "2.2"))
-PARTIAL_TP_PCT            = Decimal(os.getenv("PARTIAL_TP_PCT", "1.5"))
-TRAILING_TRIGGER_PCT      = Decimal(os.getenv("TRAILING_TRIGGER_PCT", "1.0"))
-TRAILING_DISTANCE_PCT     = Decimal(os.getenv("TRAILING_DISTANCE_PCT", "0.6"))
-BREAKEVEN_SL_PCT          = Decimal(os.getenv("BREAKEVEN_SL_PCT", "0.1"))
-TIME_STOP_HOURS           = int(os.getenv("TIME_STOP_HOURS", "4"))
-TIME_STOP_MIN_PROFIT_PCT  = Decimal(os.getenv("TIME_STOP_MIN_PROFIT_PCT", "0.5"))
-MAX_OPEN_POSITIONS        = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-MAX_POSITIONS_PER_BUCKET  = int(os.getenv("MAX_POSITIONS_PER_BUCKET", "1"))
-MIN_SIGNAL_CONFIDENCE     = int(os.getenv("MIN_SIGNAL_CONFIDENCE", "7"))
-INVOICE_EXPIRY_MINUTES    = int(os.getenv("INVOICE_EXPIRY_MINUTES", "30"))
-COINGECKO_CACHE_SECONDS   = int(os.getenv("COINGECKO_CACHE_SECONDS", "600"))
-
-USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-TX_RE               = re.compile(r"^[0-9a-fA-F]{64}$")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+USDT_WALLET = os.getenv("USDT_WALLET", "T...")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()]
+LIVE_MODE = os.getenv("LIVE_MODE","false").lower()=="true"
+AUTO_TRADE = os.getenv("AUTO_TRADE","false").lower()=="true"
+AUTO_INTERVAL_MINUTES = int(os.getenv("AUTO_INTERVAL_MINUTES","30"))
+DB_PATH = os.getenv("DB_PATH","trucklink.db")
 
 TIERS = {
-    "BASIC": {"price": Decimal("20"), "first_days": 60, "renew_days": 30, "pairs": 2},
-    "PRO":   {"price": Decimal("50"), "first_days": 60, "renew_days": 30, "pairs": 3},
-    "ELITE": {"price": Decimal("70"), "first_days": 60, "renew_days": 30, "pairs": 7},
+    "BASIC": {"price": 20, "days": 60, "pairs": 2},
+    "PRO": {"price": 50, "days": 60, "pairs": 3},
+    "ELITE": {"price": 70, "days": 60, "pairs": 7},
 }
 SYMBOLS = {
     "BASIC": ["BTC/USDT", "ETH/USDT"],
-    "PRO":   ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
-    "ELITE": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "LINK/USDT", "XRP/USDT", "PEPE/USDT"],
+    "PRO": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    "ELITE": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "PEPE/USDT", "LINK/USDT"],
 }
-CMAP = {"BTC/USDT":"bitcoin","ETH/USDT":"ethereum","SOL/USDT":"solana",
-        "BNB/USDT":"binancecoin","LINK/USDT":"chainlink","XRP/USDT":"ripple","PEPE/USDT":"pepe"}
+RISK_PER_TRADE = 0.02
+MAX_POSITIONS = 3
+MAX_DAILY_LOSS = 15
 
-BUCKETS = {
-    "BTC/USDT":  "majors",
-    "ETH/USDT":  "majors",
-    "SOL/USDT":  "alt_l1",
-    "BNB/USDT":  "alt_l1",
-    "LINK/USDT": "defi",
-    "XRP/USDT":  "payments",
-    "PEPE/USDT": "meme",
-}
+FERNET_KEY = os.getenv("FERNET_KEY")
+if not FERNET_KEY:
+    raise RuntimeError("FERNET_KEY missing in Railway! Add your existing key.")
+fernet = Fernet(FERNET_KEY.encode())
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("trucklink")
+def encrypt_api_keys(s: str) -> str: return fernet.encrypt(s.encode()).decode()
+def decrypt_api_keys(t: str) -> str:
+    try: return fernet.decrypt(t.encode()).decode()
+    except: return t
 
-# ─────────────────────────────────────────────────────────────
-# BOOTSTRAP VALIDATION
-# ─────────────────────────────────────────────────────────────
-def require_production_config():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN required")
-    if not USDT_WALLET or USDT_WALLET.startswith("TYour"):
-        raise RuntimeError("USDT_WALLET real TRC20 required")
-    if not FERNET_KEY:
-        raise RuntimeError('FERNET_KEY required: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"')
-    if AUTO_TRADE and not LIVE_MODE:
-        raise RuntimeError("AUTO_TRADE=true requires LIVE_MODE=true")
-
-if FERNET_KEY:
-    try:
-        FERNET = Fernet(FERNET_KEY.encode())
-    except Exception as e:
-        raise RuntimeError("FERNET_KEY invalid") from e
-else:
-    FERNET = None
-
-# ─────────────────────────────────────────────────────────────
-# TIME / CRYPTO / NUMERIC HELPERS
-# ─────────────────────────────────────────────────────────────
-def now_utc(): return datetime.now(timezone.utc)
-def iso(dt):   return dt.astimezone(timezone.utc).isoformat()
-def parse_dt(s): return datetime.fromisoformat(s)
-def encrypt(v):  return FERNET.encrypt(v.encode()).decode()
-def decrypt(v):  return FERNET.decrypt(v.encode()).decode()
-def to_dec(x, default="0"):
-    try: return Decimal(str(x))
-    except (InvalidOperation, TypeError, ValueError): return Decimal(default)
-
-# ─────────────────────────────────────────────────────────────
-# DATABASE
-# ─────────────────────────────────────────────────────────────
-@contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-    finally:
-        conn.close()
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
-def init_db():
+def iso(dt): return dt.astimezone(timezone.utc).isoformat()
+def now_utc(): return datetime.now(timezone.utc)
+def parse_dt(s): return datetime.fromisoformat(s.replace("Z","+00:00"))
+def to_dec(v):
+    try: return Decimal(str(v))
+    except: return Decimal("0")
+
+def require_production_config():
+    assert TELEGRAM_TOKEN, "TELEGRAM_TOKEN missing"
+    assert FERNET_KEY, "FERNET_KEY missing"
+
+def set_state(k,v):
+    with db() as c: c.execute("INSERT OR REPLACE INTO states(key,val) VALUES(?,?)", (k,v))
+def get_state(k, default="false"):
     with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY, username TEXT,
-            ref_code TEXT UNIQUE NOT NULL, referred_by TEXT, created_at TEXT NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS subscriptions(
-            user_id INTEGER PRIMARY KEY, tier TEXT NOT NULL, expiry TEXT NOT NULL,
-            first_purchase INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(user_id));
-
-        CREATE TABLE IF NOT EXISTS invoices(
-            invoice_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, tier TEXT NOT NULL,
-            base_amount TEXT NOT NULL, exact_amount TEXT NOT NULL,
-            created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING', paid_tx TEXT UNIQUE, paid_amount TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(user_id));
-
-        CREATE TABLE IF NOT EXISTS payments(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, tx_hash TEXT UNIQUE NOT NULL,
-            user_id INTEGER NOT NULL, invoice_id TEXT NOT NULL UNIQUE, tier TEXT NOT NULL,
-            amount TEXT NOT NULL, paid_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(user_id),
-            FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id));
-
-        CREATE TABLE IF NOT EXISTS api_credentials(
-            user_id INTEGER PRIMARY KEY,
-            api_key TEXT NOT NULL, api_secret TEXT NOT NULL, passphrase TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(user_id));
-
-        CREATE TABLE IF NOT EXISTS positions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL, symbol TEXT NOT NULL,
-            entry_price TEXT NOT NULL, amount TEXT NOT NULL, cost TEXT NOT NULL,
-            order_id TEXT NOT NULL UNIQUE, client_order_id TEXT,
-            sl TEXT NOT NULL, emergency_sl TEXT NOT NULL, tp TEXT NOT NULL,
-            partial_tp_done INTEGER NOT NULL DEFAULT 0,
-            sl_order_id TEXT, tp_order_id TEXT,
-            high_price TEXT NOT NULL,
-            trailing_active INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'OPEN',
-            opened_at TEXT NOT NULL, closed_at TEXT, close_order_id TEXT,
-            UNIQUE(user_id, symbol, status));
-
-        CREATE TABLE IF NOT EXISTS trades(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
-            order_id TEXT, amount TEXT, price TEXT, fee TEXT, pnl TEXT,
-            created_at TEXT NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS daily_pnl(
-            user_id INTEGER NOT NULL, day TEXT NOT NULL, pnl TEXT NOT NULL,
-            PRIMARY KEY(user_id, day));
-
-        CREATE TABLE IF NOT EXISTS equity_history(
-            user_id INTEGER NOT NULL, day TEXT NOT NULL,
-            equity TEXT NOT NULL, peak TEXT NOT NULL,
-            PRIMARY KEY(user_id, day));
-
-        CREATE TABLE IF NOT EXISTS bot_state(
-            key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
-
-        CREATE TABLE IF NOT EXISTS referrals(
-            inviter_id INTEGER NOT NULL, referred_id INTEGER NOT NULL,
-            rewarded INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
-            PRIMARY KEY(inviter_id, referred_id));
-
-        CREATE TABLE IF NOT EXISTS referral_rewards(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            inviter_id INTEGER NOT NULL, referred_id INTEGER NOT NULL,
-            tier TEXT NOT NULL, bonus_days INTEGER NOT NULL, bonus_usdt TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT NOT NULL, approved_at TEXT);
-
-        CREATE TABLE IF NOT EXISTS audit_log(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-            action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS signals_log(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
-            confidence INTEGER NOT NULL, direction TEXT NOT NULL,
-            price TEXT, sl TEXT, tp TEXT, regime TEXT, reason TEXT,
-            created_at TEXT NOT NULL);
-        """)
-
-# ─────────────────────────────────────────────────────────────
-# GLOBAL STATE
-# ─────────────────────────────────────────────────────────────
-def set_state(key, value):
-    with db() as c:
-        c.execute("INSERT INTO bot_state(key,value,updated_at) VALUES(?,?,?) "
-                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                  (key, str(value), iso(now_utc())))
-
-def get_state(key, default=None):
-    with db() as c:
-        r = c.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
-    return r["value"] if r else default
-
-def trading_enabled(uid):
-    if get_state("EMERGENCY_STOP") == "true": return False
-    if get_state(f"TRADING_ENABLED_{uid}") == "false": return False
-    return True
-
-def audit(uid, act, det=""):
-    with db() as c:
-        c.execute("INSERT INTO audit_log(user_id,action,detail,created_at) VALUES(?,?,?,?)",
-                  (uid, act, det[:2000], iso(now_utc())))
-
-# ─────────────────────────────────────────────────────────────
-# USERS / LICENSING
-# ─────────────────────────────────────────────────────────────
-def ref_code(uid): return f"TRK{uid}"
-
-def create_user(uid, username, referred_by=None):
-    with db() as c:
-        row = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        if row: return row
-        inviter = None
-        if referred_by:
-            inviter = c.execute("SELECT user_id FROM users WHERE ref_code=?",
-                                (referred_by.upper(),)).fetchone()
-            if inviter and int(inviter["user_id"]) == uid: inviter = None
-        c.execute("INSERT INTO users(user_id,username,ref_code,referred_by,created_at) VALUES(?,?,?,?,?)",
-                  (uid, username or "user", ref_code(uid),
-                   referred_by.upper() if inviter else None, iso(now_utc())))
-        if inviter:
-            c.execute("INSERT OR IGNORE INTO referrals(inviter_id,referred_id,created_at) VALUES(?,?,?)",
-                      (inviter["user_id"], uid, iso(now_utc())))
-        return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-
+        r=c.execute("SELECT val FROM states WHERE key=?", (k,)).fetchone()
+        return r["val"] if r else default
+def trading_enabled(uid): return get_state(f"TRADING_ENABLED_{uid}", "true")=="true" and get_state("EMERGENCY_STOP","false")=="false"
 def is_admin(uid): return uid in ADMIN_IDS
 
-def get_subscription(uid):
+def create_user(user_id: int, username: str = None, referred_code: str = None):
     with db() as c:
-        row = c.execute("SELECT * FROM subscriptions WHERE user_id=?", (uid,)).fetchone()
-    if not row: return None
-    try: valid = now_utc() <= parse_dt(row["expiry"])
-    except Exception: valid = False
-    return dict(row) | {"valid": valid}
+        ex = c.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not ex:
+            ref_code = f"TRUCK{user_id}"[-12:].upper()
+            c.execute("INSERT INTO users(user_id, username, ref_code, created_at) VALUES(?,?,?,?)", (user_id, username or "", ref_code, iso(now_utc())))
+            if referred_code:
+                inv = c.execute("SELECT user_id FROM users WHERE ref_code=?", (referred_code,)).fetchone()
+                if inv and inv["user_id"]!=user_id:
+                    if not c.execute("SELECT * FROM referrals WHERE referred_id=?", (user_id,)).fetchone():
+                        c.execute("INSERT INTO referrals(inviter_id, referred_id, created_at) VALUES(?,?,?)", (inv["user_id"], user_id, iso(now_utc())))
+        elif username:
+            c.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
 
 def license_info(uid):
-    if is_admin(uid):
-        return {"valid": True, "tier": "ELITE",
-                "expiry": now_utc() + timedelta(days=3650), "is_admin": True}
-    sub = get_subscription(uid)
-    if not sub or not sub["valid"]:
-        return {"valid": False, "is_first_time": sub is None}
-    return {"valid": True, "tier": sub["tier"], "expiry": parse_dt(sub["expiry"]),
-            "is_first_time": False, "is_admin": False}
-
-# ─────────────────────────────────────────────────────────────
-# INVOICES
-# ─────────────────────────────────────────────────────────────
-def create_invoice(uid, tier):
-    if tier not in TIERS: raise ValueError("Invalid tier")
-    base = TIERS[tier]["price"]
-    suffix = Decimal(secrets.randbelow(99) + 1) / Decimal("100")
-    exact = base + suffix
-    invoice_id = secrets.token_urlsafe(12)
-    created = now_utc()
-    expires = created + timedelta(minutes=INVOICE_EXPIRY_MINUTES)
+    if is_admin(uid): return {"valid": True, "tier":"ELITE", "expiry": now_utc()+timedelta(days=365), "is_admin": True}
     with db() as c:
-        c.execute("INSERT INTO invoices(invoice_id,user_id,tier,base_amount,exact_amount,"
-                  "created_at,expires_at,status) VALUES(?,?,?,?,?,?,?,?)",
-                  (invoice_id, uid, tier, str(base), str(exact), iso(created), iso(expires), "PENDING"))
-    audit(uid, "invoice_created", f"{invoice_id} {tier} {exact}")
-    return {"invoice_id": invoice_id, "tier": tier, "base": base,
-            "exact": exact, "expires": expires}
+        r=c.execute("SELECT tier, expiry FROM subscriptions WHERE user_id=? ORDER BY expiry DESC LIMIT 1", (uid,)).fetchone()
+        if not r: return {"valid": False, "tier":"NONE"}
+        try:
+            exp=parse_dt(r["expiry"])
+            return {"valid": exp>now_utc(), "tier": r["tier"], "expiry": exp, "is_admin": False}
+        except: return {"valid": False, "tier":"NONE"}
 
-def get_invoice(iid, uid):
-    with db() as c:
-        row = c.execute("SELECT * FROM invoices WHERE invoice_id=? AND user_id=?",
-                        (iid, uid)).fetchone()
-    return dict(row) if row else None
-
-# ─────────────────────────────────────────────────────────────
-# PAYMENT VERIFICATION (Tron)
-# ─────────────────────────────────────────────────────────────
-def validate_tx_hash(tx): return bool(TX_RE.fullmatch(tx or ""))
-
-async def verify_trc20_usdt(tx_hash, expected_amount, wallet):
-    if not validate_tx_hash(tx_hash):
-        return False, Decimal("0"), "Invalid TX hash (64 hex)"
-    if not wallet or wallet.startswith("TYour"):
-        return False, Decimal("0"), "Wallet not configured"
-    with db() as c:
-        if c.execute("SELECT 1 FROM payments WHERE tx_hash=?", (tx_hash,)).fetchone():
-            return False, Decimal("0"), "TX already used"
-
-    url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={tx_hash}"
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(url) as resp:
-                if resp.status != 200:
-                    return False, Decimal("0"), f"Tronscan HTTP {resp.status}"
-                data = await resp.json()
-    except Exception as e:
-        return False, Decimal("0"), f"Tronscan error: {e}"
-
-    if not data or data.get("contractRet") != "SUCCESS":
-        return False, Decimal("0"), f"TX status {data.get('contractRet','NOT FOUND')}"
-    if data.get("confirmed") is not True:
-        return False, Decimal("0"), "Not confirmed yet"
-    try:
-        ts = int(data.get("timestamp", 0)) / 1000
-        age = time.time() - ts
-        if age < 0 or age > INVOICE_EXPIRY_MINUTES * 60 + 900:
-            return False, Decimal("0"), "Outside payment window"
-    except Exception:
-        return False, Decimal("0"), "Timestamp parse fail"
-
-    transfers = data.get("trc20TransferInfo") or []
-    received = Decimal("0")
-    for t in transfers:
-        if t.get("contract_address", "").lower() != USDT_TRC20_CONTRACT.lower(): continue
-        if t.get("to_address", "").lower() != wallet.lower(): continue
-        try: received += Decimal(str(t.get("amount_str", "0"))) / Decimal("1000000")
-        except Exception: continue
-
-    if received < Decimal(str(expected_amount)):
-        return False, received, f"Underpaid ${received:.6f} (need ${Decimal(str(expected_amount)):.2f})"
-    return True, received, "Verified"
-
-def settle_payment(uid, invoice_id, tx_hash, received):
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-        invoice = c.execute("SELECT * FROM invoices WHERE invoice_id=? AND user_id=?",
-                            (invoice_id, uid)).fetchone()
-        if not invoice: c.execute("ROLLBACK"); return False, "Invoice not found"
-        if invoice["status"] != "PENDING": c.execute("ROLLBACK"); return False, "Invoice not pending"
-        if now_utc() > parse_dt(invoice["expires_at"]): c.execute("ROLLBACK"); return False, "Invoice expired"
-        if c.execute("SELECT 1 FROM payments WHERE tx_hash=?", (tx_hash,)).fetchone():
-            c.execute("ROLLBACK"); return False, "TX already used"
-
-        sub = c.execute("SELECT * FROM subscriptions WHERE user_id=?", (uid,)).fetchone()
-        first = sub is None
-        days = TIERS[invoice["tier"]]["first_days"] if first else TIERS[invoice["tier"]]["renew_days"]
-        start = now_utc()
-        if sub:
-            try:
-                old = parse_dt(sub["expiry"])
-                if old > start: start = old
-            except Exception: pass
-        expiry = start + timedelta(days=days)
-        tier = invoice["tier"]
-
-        c.execute("INSERT INTO subscriptions(user_id,tier,expiry,first_purchase,updated_at) "
-                  "VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
-                  "tier=excluded.tier,expiry=excluded.expiry,updated_at=excluded.updated_at",
-                  (uid, tier, iso(expiry), 1 if first else 0, iso(now_utc())))
-        c.execute("INSERT INTO payments(tx_hash,user_id,invoice_id,tier,amount,paid_at) VALUES(?,?,?,?,?,?)",
-                  (tx_hash, uid, invoice_id, tier, str(received), iso(now_utc())))
-        c.execute("UPDATE invoices SET status='PAID',paid_tx=?,paid_amount=? WHERE invoice_id=?",
-                  (tx_hash, str(received), invoice_id))
-
-        user_row = c.execute("SELECT referred_by FROM users WHERE user_id=?", (uid,)).fetchone()
-        if user_row and user_row["referred_by"]:
-            inviter_row = c.execute("SELECT user_id FROM users WHERE ref_code=?",
-                                    (user_row["referred_by"],)).fetchone()
-            if inviter_row:
-                inviter_id = inviter_row["user_id"]
-                exists = c.execute("SELECT 1 FROM referral_rewards WHERE referred_id=? AND inviter_id=?",
-                                   (uid, inviter_id)).fetchone()
-                if not exists:
-                    bonus_days = {"BASIC":7,"PRO":10,"ELITE":15}[tier]
-                    cnt = c.execute("SELECT COUNT(*) cnt FROM referrals WHERE inviter_id=?",
-                                    (inviter_id,)).fetchone()["cnt"]
-                    bonus_usdt = "10" if cnt >= 2 else "0"
-                    c.execute("INSERT INTO referral_rewards(inviter_id,referred_id,tier,bonus_days,"
-                              "bonus_usdt,status,created_at) VALUES(?,?,?,?,?,?,?)",
-                              (inviter_id, uid, tier, bonus_days, bonus_usdt, "PENDING", iso(now_utc())))
-        c.execute("COMMIT")
-
-    audit(uid, "payment_settled", f"{invoice_id} {tx_hash} {received}")
-    return True, {"tier": tier, "days": days, "expiry": expiry, "first": first}
-
-# ─────────────────────────────────────────────────────────────
-# API KEYS / EXCHANGE FACTORY
-# ─────────────────────────────────────────────────────────────
-def save_keys(uid, ak, sec, pp):
-    with db() as c:
-        c.execute("INSERT INTO api_credentials(user_id,api_key,api_secret,passphrase,updated_at) "
-                  "VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
-                  "api_key=excluded.api_key,api_secret=excluded.api_secret,"
-                  "passphrase=excluded.passphrase,updated_at=excluded.updated_at",
-                  (uid, encrypt(ak), encrypt(sec), encrypt(pp), iso(now_utc())))
-    audit(uid, "keys_updated")
-
-def get_keys(uid):
-    with db() as c:
-        row = c.execute("SELECT * FROM api_credentials WHERE user_id=?", (uid,)).fetchone()
-    if not row: return None
-    try:
-        return {"apiKey": decrypt(row["api_key"]),
-                "secret": decrypt(row["api_secret"]),
-                "password": decrypt(row["passphrase"])}
-    except Exception:
-        return None
-
-def make_exchange(keys):
-    ex = ccxt_async.okx({
-        "apiKey": keys["apiKey"], "secret": keys["secret"], "password": keys["password"],
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-    if not LIVE_MODE: ex.set_sandbox_mode(True)
-    return ex
-
-# ─────────────────────────────────────────────────────────────
-# MARKET DATA CACHE
-# ─────────────────────────────────────────────────────────────
-_CACHE = {}
-
-async def _cached_get_json(url, ttl, key):
-    now = time.time()
-    hit = _CACHE.get(key)
-    if hit and now - hit["t"] < ttl:
-        return hit["v"]
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(url) as resp:
-                if resp.status != 200:
-                    return hit["v"] if hit else None
-                data = await resp.json()
-        _CACHE[key] = {"t": now, "v": data}
-        return data
-    except Exception:
-        return hit["v"] if hit else None
-
-async def get_fundamentals(cid):
-    data = await _cached_get_json(
-        f"https://api.coingecko.com/api/v3/coins/{cid}?localization=false&tickers=false",
-        COINGECKO_CACHE_SECONDS, f"cg_{cid}")
-    if not data: return False
-    try: return data.get("market_cap_rank", 999) <= 150
-    except Exception: return False
-
-async def get_sentiment():
-    data = await _cached_get_json(
-        "https://api.alternative.me/fng/?limit=1", 300, "fng")
-    if not data: return 50, False
-    try:
-        v = int(data["data"][0]["value"])
-        return v, 20 < v < 90
-    except Exception:
-        return 50, False
-# ─────────────────────────────────────────────────────────────
-# DAILY PNL TRACKING (WAS MISSING)
-# ─────────────────────────────────────────────────────────────
 def daily_pnl(uid):
     day = now_utc().date().isoformat()
     with db() as c:
         r = c.execute("SELECT pnl FROM daily_pnl WHERE user_id=? AND day=?", (uid, day)).fetchone()
-    if not r:
-        return Decimal("0")
-    try:
-        return to_dec(r["pnl"])
-    except:
-        return Decimal("0")
+    return to_dec(r["pnl"]) if r else Decimal("0")
 
-def add_daily_pnl(uid, pnl: Decimal):
-    day = now_utc().date().isoformat()
+def grant_trial(uid):
     with db() as c:
-        cur = c.execute("SELECT pnl FROM daily_pnl WHERE user_id=? AND day=?", (uid, day)).fetchone()
-        if cur:
-            new_val = to_dec(cur["pnl"]) + to_dec(pnl)
-        else:
-            new_val = to_dec(pnl)
-        c.execute("INSERT INTO daily_pnl(user_id,day,pnl) VALUES(?,?,?) "
-                  "ON CONFLICT(user_id,day) DO UPDATE SET pnl=excluded.pnl",
-                  (uid, day, str(new_val)))
+        if c.execute("SELECT * FROM subscriptions WHERE user_id=? AND expiry>? ", (uid, iso(now_utc()))).fetchone():
+            return False, "You already have active subscription"
+        if c.execute("SELECT * FROM trials WHERE user_id=?", (uid,)).fetchone():
+            return False, "Trial already used"
+        exp = now_utc() + timedelta(hours=24)
+        c.execute("INSERT OR REPLACE INTO subscriptions(user_id, tier, expiry) VALUES(?,?,?)", (uid, "BASIC", iso(exp)))
+        c.execute("INSERT INTO trials(user_id, created_at) VALUES(?,?)", (uid, iso(now_utc())))
+        return True, "Granted"
 
-# Initialize DB on import
-init_db()
+def check_circuit_breaker(uid):
+    pnl = daily_pnl(uid)
+    if pnl < Decimal(f"-{MAX_DAILY_LOSS}"):
+        set_state(f"TRADING_ENABLED_{uid}", "false")
+        return True
+    return False
+
+def create_invoice(uid, tier):
+    base = float(TIERS[tier]["price"])
+    exact = base + random.uniform(0.000001, 0.000999)
+    inv_id = str(uuid.uuid4())[:8].upper()
+    exp = now_utc() + timedelta(minutes=30)
+    with db() as c:
+        c.execute("INSERT INTO invoices(invoice_id, user_id, tier, base_amount, exact_amount, status, expires_at, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                  (inv_id, uid, tier, str(base), str(exact), "PENDING", iso(exp), iso(now_utc())))
+    return {"invoice_id": inv_id, "base": base, "exact": exact, "expires": exp}
+
+def get_invoice(inv_id, uid):
+    with db() as c: return c.execute("SELECT * FROM invoices WHERE invoice_id=? AND user_id=?", (inv_id, uid)).fetchone()
+def validate_tx_hash(h): return bool(re.match(r"^[a-fA-F0-9]{64}$", h))
+
+# SECURED - DETECTS FAKE HASH & UNDERPAYMENT
+async def verify_trc20_usdt(tx_hash, expected: Decimal, wallet: str):
+    USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    if not validate_tx_hash(tx_hash):
+        return False, Decimal("0"), "Invalid hash format"
+    with db() as c:
+        if c.execute("SELECT * FROM invoices WHERE tx_hash=?", (tx_hash,)).fetchone():
+            return False, Decimal("0"), "❌ TX already used"
+        if c.execute("SELECT * FROM payments WHERE tx_hash=?", (tx_hash,)).fetchone():
+            return False, Decimal("0"), "❌ TX already used"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://apilist.tronscanapi.com/api/transaction-info?hash={tx_hash}", timeout=15) as r:
+                if r.status!= 200:
+                    return False, Decimal("0"), f"Tronscan error {r.status}"
+                j = await r.json()
+                if not j.get("confirmed"):
+                    return False, Decimal("0"), "Not confirmed yet - wait 1 min"
+                if j.get("confirmations",0) < 20:
+                    return False, Decimal("0"), f"Need 20 conf, got {j.get('confirmations')}"
+                if j.get("contractRet")!= "SUCCESS":
+                    return False, Decimal("0"), f"TX failed {j.get('contractRet')}"
+                trc20 = j.get("trc20TransferInfo", []) or j.get("tokenTransferInfo", {}).get("transfersAllList", [])
+                found = False
+                received_amount = Decimal("0")
+                for t in trc20:
+                    to_addr = t.get("to_address") or t.get("toAddress") or ""
+                    contract = t.get("contract_address") or t.get("contractAddress") or ""
+                    amt_str = t.get("amount_str") or t.get("amount") or "0"
+                    try:
+                        amt = Decimal(str(amt_str)) / Decimal("1000000") if Decimal(str(amt_str)) > Decimal("1000000") else Decimal(str(amt_str))
+                    except:
+                        amt = Decimal(str(t.get("quant",0))) / Decimal("1000000")
+                    if USDT_CONTRACT not in str(t) and contract!= USDT_CONTRACT:
+                        continue
+                    if to_addr.lower()!= wallet.lower() and to_addr!= wallet:
+                        continue
+                    found = True
+                    received_amount = amt
+                    break
+                if not found:
+                    return False, Decimal("0"), f"❌ No USDT to {wallet[:6]}... in this TX - fake hash"
+                if received_amount < expected - Decimal("0.00001"):
+                    return False, received_amount, f"❌ Underpayment: got ${received_amount:.6f} need EXACT ${expected:.6f}. Send ${expected - received_amount:.6f} more"
+                return True, received_amount, "OK"
+    except Exception as e:
+        log.exception(f"verify error")
+        return False, Decimal("0"), f"Verify error {e} - retry"
+
+def settle_payment(uid, invoice_id, tx_hash, received):
+    with db() as c:
+        inv=c.execute("SELECT * FROM invoices WHERE invoice_id=?", (invoice_id,)).fetchone()
+        if not inv: return False, "Invoice not found"
+        tier=inv["tier"]
+        days=TIERS[tier]["days"]
+        old=c.execute("SELECT expiry FROM subscriptions WHERE user_id=?", (uid,)).fetchone()
+        base=now_utc()
+        if old:
+            try:
+                o=parse_dt(old["expiry"])
+                if o>base: base=o
+            except: pass
+        new_exp=base+timedelta(days=days)
+        c.execute("INSERT OR REPLACE INTO subscriptions(user_id, tier, expiry) VALUES(?,?,?)", (uid, tier, iso(new_exp)))
+        c.execute("UPDATE invoices SET status='PAID', tx_hash=?, paid_amount=? WHERE invoice_id=?", (tx_hash, str(received), invoice_id))
+        c.execute("INSERT INTO payments(id, user_id, tier, amount, tx_hash, created_at) VALUES(?,?,?,?,?,?)", (invoice_id, uid, tier, str(received), tx_hash, iso(now_utc())))
+        ref=c.execute("SELECT inviter_id FROM referrals WHERE referred_id=?", (uid,)).fetchone()
+        if ref:
+            c.execute("INSERT INTO referral_rewards(inviter_id, referred_id, tier, bonus_days, status, created_at) VALUES(?,?,?,?,?,?)",
+                      (ref["inviter_id"], uid, tier, 5, "PENDING", iso(now_utc())))
+    return True, {"tier": tier, "days": days, "expiry": new_exp}
+
+def save_keys(uid, ak, sec, pp):
+    enc_ak=encrypt_api_keys(ak); enc_sec=encrypt_api_keys(sec); enc_pp=encrypt_api_keys(pp)
+    with db() as c: c.execute("INSERT OR REPLACE INTO api_keys(user_id, apiKey, secret, password, updated_at) VALUES(?,?,?,?,?)", (uid, enc_ak, enc_sec, enc_pp, iso(now_utc())))
+def get_keys(uid):
+    with db() as c:
+        r=c.execute("SELECT * FROM api_keys WHERE user_id=?", (uid,)).fetchone()
+        if not r: return None
+        try:
+            return {"apiKey": decrypt_api_keys(r["apiKey"]), "secret": decrypt_api_keys(r["secret"]), "password": decrypt_api_keys(r["password"])}
+        except:
+            return None
+
+def make_exchange(keys):
+    import ccxt.async_support as ccxt_async
+    ex=ccxt_async.okx({"apiKey": keys["apiKey"], "secret": keys["secret"], "password": keys["password"], "enableRateLimit": True, "options":{"defaultType":"spot"}})
+    if not LIVE_MODE: ex.set_sandbox_mode(True)
+    return ex
+
+def init_db():
+    with db() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS states(key TEXT PRIMARY KEY, val TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS daily_pnl(user_id INTEGER, day TEXT, pnl TEXT, PRIMARY KEY(user_id, day))")
+        c.execute("CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT, ref_code TEXT, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS referrals(inviter_id INTEGER, referred_id INTEGER PRIMARY KEY, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS referral_rewards(id INTEGER PRIMARY KEY AUTOINCREMENT, inviter_id INTEGER, referred_id INTEGER, tier TEXT, bonus_days INTEGER, status TEXT, created_at TEXT, approved_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS subscriptions(user_id INTEGER PRIMARY KEY, tier TEXT, expiry TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS trials(user_id INTEGER PRIMARY KEY, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS invoices(invoice_id TEXT PRIMARY KEY, user_id INTEGER, tier TEXT, base_amount TEXT, exact_amount TEXT, status TEXT, expires_at TEXT, created_at TEXT, tx_hash TEXT, paid_amount TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id INTEGER, tier TEXT, amount TEXT, tx_hash TEXT, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS positions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, symbol TEXT, side TEXT, entry_price TEXT, amount TEXT, sl TEXT, tp TEXT, sl_order_id TEXT, status TEXT, created_at TEXT, close_price TEXT, close_reason TEXT, pnl TEXT, closed_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS api_keys(user_id INTEGER PRIMARY KEY, apiKey TEXT, secret TEXT, password TEXT, updated_at TEXT)")
